@@ -76,6 +76,7 @@ from vllm.v1.outputs import (
     KVConnectorOutput,
     ModelRunnerOutput,
 )
+from vllm.v1.worker.gpu_fault import GpuFault
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -87,6 +88,25 @@ class ExceptionWithKVConnectorOutput(Exception):
     def __init__(self, error_msg: str, kv_connector_output: KVConnectorOutput | None):
         super().__init__(error_msg)
         self.kv_connector_output = kv_connector_output
+
+
+@dataclass
+class WorkerFailure:
+    """A worker's failure response: the error text and its GPU classification."""
+
+    message: str
+    gpu_fault: GpuFault | None = None
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class WorkerFailedError(RuntimeError):
+    """One or more workers failed; carries their GPU fault classifications."""
+
+    def __init__(self, message: str, gpu_faults: list[GpuFault]):
+        super().__init__(message)
+        self.gpu_faults = gpu_faults
 
 
 class FutureWrapper(Future):
@@ -522,6 +542,7 @@ class MultiprocExecutor(Executor):
         def get_response():
             responses = []
             has_failure = False
+            gpu_faults: list[GpuFault] = []
 
             for mq in response_mqs:
                 dequeue_timeout = (
@@ -542,13 +563,16 @@ class MultiprocExecutor(Executor):
                     assert isinstance(result, KVConnectorOutput)
                     responses.append(result)
                 elif status != WorkerProc.ResponseStatus.SUCCESS:
+                    if (gpu_fault := getattr(result, "gpu_fault", None)) is not None:
+                        gpu_faults.append(gpu_fault)
                     if (
                         not self.vllm_config.parallel_config.enable_fault_tolerance
                         or self.is_failed
                     ):
-                        raise RuntimeError(
+                        raise WorkerFailedError(
                             f"Worker failed with error '{result}', please check the"
-                            " stack trace above for the root cause"
+                            " stack trace above for the root cause",
+                            gpu_faults,
                         )
                     has_failure = True
                 else:
@@ -569,7 +593,7 @@ class MultiprocExecutor(Executor):
                         kv_connector_outputs
                     )
 
-                raise RuntimeError("One or more workers failed")
+                raise WorkerFailedError("One or more workers failed", gpu_faults)
 
             return responses[0] if output_rank is not None else responses
 
@@ -1152,11 +1176,21 @@ class WorkerProc:
                 output.kv_connector_output,
             )
         elif isinstance(output, Exception):
-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            result = (
+                WorkerProc.ResponseStatus.FAILURE,
+                WorkerFailure(str(output), self._classify_fault(output)),
+            )
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
+
+    def _classify_fault(self, exc: Exception) -> GpuFault | None:
+        try:
+            return self.worker.classify_fault(exc)
+        except Exception:
+            logger.debug("GPU fault classification failed", exc_info=True)
+            return None
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,

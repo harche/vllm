@@ -116,6 +116,7 @@ from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder, bytestr
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import compute_iteration_details
+from vllm.v1.worker.gpu_fault import write_termination_log
 from vllm.version import __version__ as VLLM_VERSION
 
 logger = init_logger(__name__)
@@ -1728,6 +1729,7 @@ class EngineCoreProc(EngineCore):
                 logger.exception("EngineCore failed to start.")
             else:
                 logger.exception("EngineCore encountered a fatal error.")
+                write_termination_log(engine_core.model_executor.classify_fault(e))
                 engine_core._send_engine_dead()
             raise e
         finally:

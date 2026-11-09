@@ -118,6 +118,7 @@ from vllm.v1.worker.extensible_kv_cache import (
     pad_kv_cache_segments,
     registers_kv_cache_memory,
 )
+from vllm.v1.worker.gpu_fault import GpuFault, classify_gpu_fault
 from vllm.v1.worker.sentinel.gpu_worker_sentinel import WorkerSentinel
 from vllm.v1.worker.startup_plan import (
     maybe_apply_startup_plan,
@@ -1693,6 +1694,9 @@ class Worker(WorkerBase):
     def check_health(self) -> None:
         # worker will always be healthy as long as it's running.
         return
+
+    def classify_fault(self, exc: BaseException) -> GpuFault | None:
+        return classify_gpu_fault(exc, self.local_rank)
 
     def save_sharded_state(
         self,

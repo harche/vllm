@@ -27,6 +27,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+    from vllm.v1.worker.gpu_fault import GpuFault
 
 logger = init_logger(__name__)
 
@@ -367,6 +368,10 @@ class Executor(ABC):
         """Checks if the executor is healthy. If not, it should raise an
         exception."""
         raise NotImplementedError
+
+    def classify_fault(self, exc: BaseException) -> list["GpuFault"]:
+        """GPU fault classifications carried by an exception from this executor."""
+        return list(getattr(exc, "gpu_faults", ()))
 
     def shutdown(self) -> None:
         """Shutdown the executor."""

@@ -25,6 +25,7 @@ from vllm.v1.kv_cache_interface import KVCacheSpec
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
     from vllm.v1.outputs import AsyncModelRunnerOutput, ModelRunnerOutput
+    from vllm.v1.worker.gpu_fault import GpuFault
 else:
     SchedulerOutput = object
     GrammarOutput = object
@@ -147,6 +148,10 @@ class WorkerBase:
     def check_health(self) -> None:
         """Basic health check (override for device-specific checks)."""
         return
+
+    def classify_fault(self, exc: BaseException) -> "GpuFault | None":
+        """Classify an exception raised by this worker as a device fault."""
+        return None
 
     def synchronize_device(self) -> None:
         """Block until in-flight device work completes; backends outside

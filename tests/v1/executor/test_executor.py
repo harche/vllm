@@ -22,12 +22,18 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.executor import multiproc_executor as multiproc_executor_module
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
+from vllm.v1.executor.multiproc_executor import (
+    MultiprocExecutor,
+    WorkerFailedError,
+    WorkerFailure,
+    WorkerProc,
+)
 from vllm.v1.executor.uniproc_executor import (
     ExecutorWithExternalLauncher,
     UniProcExecutor,
 )
 from vllm.v1.outputs import ModelRunnerOutput
+from vllm.v1.worker.gpu_fault import GpuFault
 
 
 class Mock: ...
@@ -321,3 +327,22 @@ def test_ft_rpc_failure_keeps_next_rpc_responses_aligned(
         "recovered0",
         "recovered1",
     ]
+
+
+@pytest.mark.parametrize("enable_ft", [True, False])
+def test_worker_failure_carries_gpu_fault(enable_ft):
+    """The engine must see each worker's GPU fault, not only an error string."""
+    fault = GpuFault(cuda_error=700, sticky=True, gpu_uuid="GPU-0")
+    executor = _make_failed_step_executor(enable_ft=enable_ft)
+    executor.response_mqs = [
+        _FakeResponseMQ(
+            [(WorkerProc.ResponseStatus.FAILURE, WorkerFailure("illegal", fault))]
+        ),
+        _FakeResponseMQ([(WorkerProc.ResponseStatus.SUCCESS, None)]),
+    ]
+
+    with pytest.raises(WorkerFailedError) as exc_info:
+        executor.collective_rpc("execute_model")
+
+    assert exc_info.value.gpu_faults == [fault]
+    assert executor.classify_fault(exc_info.value) == [fault]

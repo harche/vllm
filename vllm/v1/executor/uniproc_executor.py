@@ -24,6 +24,7 @@ from vllm.v1.executor.abstract import Executor
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
 from vllm.v1.outputs import AsyncModelRunnerOutput, DraftTokenIds, ModelRunnerOutput
 from vllm.v1.serial_utils import run_method
+from vllm.v1.worker.gpu_fault import GpuFault
 from vllm.v1.worker.worker_base import WorkerWrapperBase
 
 logger = init_logger(__name__)
@@ -148,6 +149,14 @@ class UniProcExecutor(Executor):
         # UniProcExecutor will always be healthy as long as
         # it's running.
         return
+
+    def classify_fault(self, exc: BaseException) -> list[GpuFault]:
+        try:
+            fault = self.driver_worker.classify_fault(exc)
+        except Exception:
+            logger.debug("GPU fault classification failed", exc_info=True)
+            return []
+        return [fault] if fault is not None else []
 
     def shutdown(self) -> None:
         if worker := self.driver_worker:
