@@ -303,11 +303,11 @@ def test_context_probe_uses_the_device_index_recorded_at_startup(monkeypatch):
 
     probed = []
 
-    def synchronize(device=None) -> None:
+    def stream(device=None):
         probed.append(device)
         raise _cuda_error(719)
 
-    monkeypatch.setattr(torch.accelerator, "synchronize", synchronize)
+    monkeypatch.setattr(torch.cuda, "Stream", stream)
     exc = RuntimeError("NCCL error: unhandled cuda error")
 
     fault = LostDevicePlatform.classify_device_fault(

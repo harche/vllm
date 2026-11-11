@@ -252,8 +252,14 @@ class EngineCoreSentinel:
         payload = {"id": self.engine_index, "status": self.status_type.name.lower()}
         if self.status_type in (EngineStatusType.UNHEALTHY, EngineStatusType.DEAD):
             payload["fault_info"] = self.fault_info
-            if self.device_fault is not None:
-                payload["device_fault"] = self.device_fault.to_dict()
+            fault = self.device_fault
+            # An engine can also end DEAD for a reason other than its device
+            # fault, such as a failed recovery. A fault that does not require
+            # a restart would contradict that status, so it is left out.
+            if fault is not None and (
+                self.status_type == EngineStatusType.UNHEALTHY or fault.restart_required
+            ):
+                payload["device_fault"] = fault.to_dict()
         if self.status_type == EngineStatusType.UNHEALTHY and mask is not None:
             payload["mask"] = mask
         outputs = EngineCoreOutputs(
@@ -280,10 +286,12 @@ class EngineCoreSentinel:
                 args=(ft_request,),
                 timeout=self.engine_recovery_timeout_sec,
             )
+            faults = [r["device_fault"] for r in results]
         except Exception:
+            # This includes a reply that is not an answer to the query, left
+            # in a queue by an earlier call that timed out.
             logger.warning("[FT] Failed to query device faults", exc_info=True)
             return None
-        faults = [r["device_fault"] for r in results]
         return select_device_fault([f for f in faults if f is not None])
 
     def _query_mask(self) -> list[int]:
@@ -490,13 +498,20 @@ class EngineCoreSentinel:
         if success.item():
             return
 
-        if terminal:
+        error = local_error or RuntimeError("[FT] Recovery vote failed")
+        # A worker may have hit a device fault during the recovery itself.
+        # One that requires a restart ends recovery in place.
+        fault = self._query_device_fault()
+        if fault is not None and fault.restart_required:
+            self.device_fault = fault
+            self.fault_info = describe_fault(error, fault)
+            self.status_type = EngineStatusType.DEAD
+            self._push_status()
+        elif terminal:
             self.status_type = EngineStatusType.DEAD
             self.fault_info = "Recovery failed; full restart required"
             self._push_status()
-        if local_error is not None:
-            raise local_error
-        raise RuntimeError("[FT] Recovery vote failed")
+        raise error
 
     def _mark_healthy(self, ft_request: FaultToleranceRequest) -> FaultToleranceResult:
         self.status_type = EngineStatusType.HEALTHY

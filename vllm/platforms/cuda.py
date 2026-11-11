@@ -379,8 +379,15 @@ class CudaPlatformBase(Platform):
         NVML when CUDA_VISIBLE_DEVICES lists device UUIDs, and NVML fails
         that lookup for a lost device. The probe would then fail before it
         reached CUDA, and the fault would go unclassified.
+
+        The call synchronizes a side stream, not the device. After a fault
+        the default stream may hold a kernel that never finishes, such as a
+        collective waiting on a dead peer, and a device-wide synchronize
+        would wait for it.
         """
-        torch.accelerator.synchronize(visible_device_id)
+        # TODO: confirm on H100 that synchronizing an idle side stream
+        # returns the sticky error left by a device-side assert.
+        torch.cuda.Stream(device=visible_device_id).synchronize()
 
     @classmethod
     def is_fully_connected(cls, device_ids: list[int]) -> bool:
@@ -891,17 +898,16 @@ class NvmlCudaPlatform(CudaPlatformBase):
 
         try:
             return cls._query_nvml_fault_state(device_id)
-        except pynvml.NVMLError as e:
+        except Exception as e:
             # A device that has fallen off the bus, or that needs a reset,
             # answers no query, so it never reports a recovery action. NVML
             # says so with an error from whichever call touches the device
             # first, including nvmlInit. Report it, or the fault would look
             # retryable.
-            driver_error = _nvml_restart_error(e.value)
-            if driver_error is not None:
-                return CudaDeviceState(driver_error=driver_error)
-            logger.warning("NVML device state query failed", exc_info=True)
-        except Exception:
+            if isinstance(e, pynvml.NVMLError):
+                driver_error = _nvml_restart_error(e.value)
+                if driver_error is not None:
+                    return CudaDeviceState(driver_error=driver_error)
             logger.warning("NVML device state query failed", exc_info=True)
         # Classifying a fault must not raise a second one. When the driver
         # cannot be asked, the CUDA error class alone decides.

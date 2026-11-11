@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import threading
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
@@ -29,7 +30,11 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
 from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_ip
-from vllm.v1.fault_tolerance.utils import DeviceFault, FaultToleranceRequest
+from vllm.v1.fault_tolerance.utils import (
+    ALLOWED_FT_INSTRUCTIONS,
+    DeviceFault,
+    FaultToleranceRequest,
+)
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.sentinel.eplb_redistribute import (
     compute_dead_ep_ranks,
@@ -92,6 +97,7 @@ class WorkerSentinel:
         self.worker = worker
         self.device_uuid: str | None = None
         self.device_fault: DeviceFault | None = None
+        self._device_fault_lock = threading.Lock()
         all2all_backend = worker.parallel_config.all2all_backend
         if all2all_backend not in FT_BACKEND_SET:
             raise ValueError(
@@ -145,13 +151,21 @@ class WorkerSentinel:
         fault = self.classify_fault(exc)
         if fault is None:
             return
-        # A later error must not hide a fault that requires a restart.
-        if self.device_fault is None or not self.device_fault.restart_required:
-            self.device_fault = fault
+        # With async scheduling the output thread records faults too.
+        with self._device_fault_lock:
+            # A later error must not hide a fault that requires a restart.
+            if self.device_fault is None or not self.device_fault.restart_required:
+                self.device_fault = fault
 
     def query_device_fault(self, ft_request: FaultToleranceRequest) -> dict:
-        """Hand the recorded device fault to the engine and clear it."""
-        fault, self.device_fault = self.device_fault, None
+        """Hand the recorded device fault to the engine.
+
+        The fault is kept, because the engine's query fails as a whole when
+        any worker does not answer, and it then asks again. It is cleared
+        when this worker completes a recovery. See `handle_command`.
+        """
+        with self._device_fault_lock:
+            fault = self.device_fault
         if fault is None:
             # Device errors are reported asynchronously, so this worker's
             # device may hold one that no call has raised yet.
@@ -169,7 +183,13 @@ class WorkerSentinel:
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""
         with set_current_vllm_config(self.worker.vllm_config):
-            return run_method(self, ft_request.instruction, (ft_request,), {})
+            result = run_method(self, ft_request.instruction, (ft_request,), {})
+        if ft_request.instruction in ALLOWED_FT_INSTRUCTIONS:
+            # This worker recovered, so the fault it recorded is over. A
+            # recovery that raises keeps it, with any fault it hit itself.
+            with self._device_fault_lock:
+                self.device_fault = None
+        return result
 
     def activate_cpu_group_timeouts(self, ft_request: FaultToleranceRequest):
         enter_steady_state()

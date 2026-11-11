@@ -9,11 +9,14 @@ from concurrent.futures import Future
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
+import pytest
+
 from vllm.config import ParallelConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import KVConnectorOutput
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.fault_tolerance.cuda_fault import CudaFault
 from vllm.v1.fault_tolerance.engine_core_sentinel import EngineCoreSentinel
+from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
 from vllm.v1.outputs import ModelRunnerOutput
 
 
@@ -80,6 +83,7 @@ class _StubExecutor:
     def __init__(self, is_failed: bool, worker_faults: list[CudaFault | None]):
         self.is_failed = is_failed
         self.worker_faults = worker_faults
+        self.recovery_error: Exception | None = None
         self.instructions: list[str] = []
 
     def collective_rpc(self, method, args=(), timeout=None):
@@ -89,12 +93,20 @@ class _StubExecutor:
         if instruction == "query_device_fault":
             if self.worker_faults is _NO_ANSWER:
                 raise TimeoutError("RPC call to handle_ft_command timed out.")
+            if self.worker_faults is _STALE_REPLY:
+                return [None]
             return [{"device_fault": fault} for fault in self.worker_faults]
+        if instruction == "retry":
+            if self.recovery_error is not None:
+                raise self.recovery_error
+            return [None for _ in self.worker_faults]
         return [{"mask": [0, 0]} for _ in self.worker_faults]
 
 
 # The workers do not answer the device fault query.
 _NO_ANSWER: list[CudaFault | None] = []
+# The query reads a reply that an earlier, timed-out call left in the queue.
+_STALE_REPLY: list[CudaFault | None] = []
 
 
 def _make_fault_sentinel(
@@ -115,6 +127,7 @@ def _make_fault_sentinel(
         scheduler=MagicMock(),
         model_executor=_StubExecutor(executor_failed, worker_faults),
         output_queue=output_queue,
+        batch_queue=None,
         _send_abort_outputs=lambda aborted: None,
     )
     sentinel = EngineCoreSentinel(engine, ParallelConfig())
@@ -201,6 +214,65 @@ def test_fault_is_reported_unclassified_when_the_workers_do_not_answer():
     assert status["status"] == "unhealthy"
     assert status["fault_info"] == "RuntimeError"
     assert "device_fault" not in status
+
+
+def test_fault_is_reported_unclassified_when_the_reply_is_not_an_answer():
+    """Fault handling must not fail on a reply it cannot read."""
+    sentinel, pushed_statuses = _make_fault_sentinel(_STALE_REPLY)
+
+    sentinel.on_fault(TimeoutError("RPC call to execute_model timed out."))
+
+    status = pushed_statuses()[-1]
+    assert status["status"] == "unhealthy"
+    assert "device_fault" not in status
+
+
+def test_restart_fault_found_during_a_failed_retry_is_reported_dead():
+    """A worker can hit the fault that requires a restart only when the
+    retry touches its device."""
+    sentinel, pushed_statuses = _make_fault_sentinel([None])
+    sentinel.on_fault(RuntimeError("boom"))
+    pushed_statuses()
+
+    executor = sentinel.engine.model_executor
+    executor.recovery_error = RuntimeError("One or more workers failed")
+    executor.worker_faults = [STICKY]
+    with pytest.raises(RuntimeError, match="One or more workers failed"):
+        sentinel.retry(FaultToleranceRequest(instruction="retry", params={}))
+
+    assert pushed_statuses() == [
+        {
+            "id": 0,
+            "status": "dead",
+            "fault_info": f"RuntimeError: {STICKY}; restart required",
+            "device_fault": STICKY.to_dict(),
+        }
+    ]
+
+
+def test_failed_retry_without_a_restart_fault_stays_unhealthy():
+    sentinel, pushed_statuses = _make_fault_sentinel([RETRYABLE])
+    sentinel.on_fault(RuntimeError("boom"))
+    pushed_statuses()
+
+    sentinel.engine.model_executor.recovery_error = RuntimeError("retry failed")
+    with pytest.raises(RuntimeError, match="retry failed"):
+        sentinel.retry(FaultToleranceRequest(instruction="retry", params={}))
+
+    assert pushed_statuses() == []
+
+
+def test_dead_for_another_reason_does_not_carry_a_fault_that_allows_retry():
+    """`dead` beside `restart_required: false` would contradict itself."""
+    sentinel, pushed_statuses = _make_fault_sentinel([RETRYABLE])
+    sentinel.on_fault(RuntimeError("boom"))
+    pushed_statuses()
+
+    sentinel.on_executor_failed()
+
+    assert pushed_statuses() == [
+        {"id": 0, "status": "dead", "fault_info": f"RuntimeError: {RETRYABLE}"}
+    ]
 
 
 def test_classification_of_an_earlier_fault_is_not_reported_again():

@@ -1228,13 +1228,14 @@ class WorkerProc:
             if hasattr(e, "add_note"):
                 e.add_note(traceback.format_exc())
             logger.exception("WorkerProc hit an exception.")
-            # Every rank records its own fault. Only one rank replies to a
-            # model step, so the engine asks all of them afterwards.
-            self._record_fault(e)
             # enqueue_output converts the exception to a FAILURE response
             # containing its string representation before transport.
             if output_rank is None or self.rank == output_rank:
                 self.handle_output(e)
+            # Every rank records its own fault. Only one rank replies to a
+            # model step, so the engine asks all of them afterwards. The
+            # reply goes first so that classifying does not delay it.
+            self._record_fault(e)
 
     @staticmethod
     def setup_proc_title_and_log_prefix(enable_ep: bool) -> None:

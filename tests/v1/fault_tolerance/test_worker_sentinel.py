@@ -4,6 +4,8 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from vllm.config import ParallelConfig
 from vllm.v1.fault_tolerance.cuda_fault import CudaFault
 from vllm.v1.fault_tolerance.utils import DeviceFault, FaultToleranceRequest
@@ -13,6 +15,7 @@ STICKY = CudaFault(error_code=710, sticky=True, recovery_action="NONE")
 RETRYABLE = CudaFault(error_code=2, sticky=False, recovery_action="NONE")
 
 QUERY = FaultToleranceRequest(instruction="query_device_fault", params={})
+RETRY = FaultToleranceRequest(instruction="retry", params={})
 
 
 class _ScriptedSentinel(WorkerSentinel):
@@ -28,20 +31,44 @@ class _ScriptedSentinel(WorkerSentinel):
         )
         super().__init__(worker)  # type: ignore[arg-type]
         self.by_error = by_error
+        self.retry_error: Exception | None = None
 
     def classify_fault(self, exc: BaseException | None) -> DeviceFault | None:
         return self.by_error.get(exc)
 
+    def retry(self, ft_request: FaultToleranceRequest) -> None:
+        # The real recovery rebuilds process groups across ranks.
+        if self.retry_error is not None:
+            raise self.retry_error
 
-def test_recorded_fault_is_handed_to_the_engine_once():
+
+def test_recorded_fault_is_kept_until_the_worker_recovers():
+    """The engine's query fails as a whole when one worker does not answer,
+    so it has to be able to ask again."""
     error = RuntimeError("step failed")
     sentinel = _ScriptedSentinel({error: RETRYABLE})
 
     sentinel.record_fault(error)
 
     assert sentinel.handle_command(QUERY) == {"device_fault": RETRYABLE}
+    assert sentinel.handle_command(QUERY) == {"device_fault": RETRYABLE}
+
+    sentinel.handle_command(RETRY)
+
     # A fault from before a recovery must not be reported for the next one.
     assert sentinel.handle_command(QUERY) == {"device_fault": None}
+
+
+def test_recorded_fault_survives_a_recovery_that_fails_on_this_worker():
+    error = RuntimeError("step failed")
+    sentinel = _ScriptedSentinel({error: RETRYABLE})
+    sentinel.record_fault(error)
+    sentinel.retry_error = RuntimeError("retry failed")
+
+    with pytest.raises(RuntimeError, match="retry failed"):
+        sentinel.handle_command(RETRY)
+
+    assert sentinel.handle_command(QUERY) == {"device_fault": RETRYABLE}
 
 
 def test_error_that_is_not_a_device_fault_records_nothing():
