@@ -83,6 +83,12 @@ class CudaFault(DeviceFault):
     `recovery_action` is the NVML GPU recovery action."""
 
     backend: ClassVar[str] = "cuda"
+    status_fields: ClassVar[tuple[str, ...]] = (
+        "error_code",
+        "sticky",
+        "recovery_action",
+        "driver_error",
+    )
 
     # Set when the driver refused the query with one of RESTART_DRIVER_ERRORS.
     # Such a device reports no recovery action, because it answers no queries

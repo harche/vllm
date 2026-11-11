@@ -2,6 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """CUDA fault classification: is the worker's CUDA context still usable?"""
 
+from dataclasses import dataclass
+from typing import ClassVar
+
 import pytest
 import torch
 
@@ -227,6 +230,54 @@ def test_backend_fault_without_a_backend_name_fails_at_class_definition():
                 return False
 
 
+def test_backend_fault_without_published_fields_fails_at_class_definition():
+    with pytest.raises(TypeError, match="status_fields"):
+
+        class UnlistedFault(ft_utils.DeviceFault):
+            backend = "unlisted"
+
+            @property
+            def restart_required(self) -> bool:
+                return False
+
+
+def test_backend_fault_publishing_an_unknown_field_fails_at_class_definition():
+    with pytest.raises(TypeError, match="serial"):
+
+        class MisnamedFault(ft_utils.DeviceFault):
+            backend = "misnamed"
+            status_fields = ("error_code", "serial")
+
+            @property
+            def restart_required(self) -> bool:
+                return False
+
+
+def test_field_a_backend_does_not_list_stays_out_of_the_status():
+    """The status API publishes a field only when the backend names it, so
+    a hardware identifier added to a fault is not exposed by default."""
+
+    @dataclass(frozen=True)
+    class IdentifiedFault(ft_utils.DeviceFault):
+        backend: ClassVar[str] = "identified"
+        status_fields: ClassVar[tuple[str, ...]] = ("error_code", "sticky")
+
+        device_uuid: str = ""
+
+        @property
+        def restart_required(self) -> bool:
+            return False
+
+    fault = IdentifiedFault(error_code=1, sticky=False, device_uuid="GPU-1234")
+
+    assert fault.to_dict() == {
+        "backend": "identified",
+        "error_code": 1,
+        "sticky": False,
+        "restart_required": False,
+    }
+
+
 def test_context_probe_uses_the_device_index_recorded_at_startup(monkeypatch):
     """With device UUIDs in CUDA_VISIBLE_DEVICES the index is found through
     NVML, which a lost device fails. The probe must not depend on it."""
@@ -261,9 +312,12 @@ def test_context_probe_uses_the_device_index_recorded_at_startup(monkeypatch):
 def test_platforms_do_not_classify_faults_by_default():
     """A CUDA error code means nothing on a platform that has not said how
     to read it, so other accelerators report no classification."""
-    assert Platform.classify_device_fault(
-        _cuda_error(700), device_id=0, visible_device_id=0
-    ) is None
+    assert (
+        Platform.classify_device_fault(
+            _cuda_error(700), device_id=0, visible_device_id=0
+        )
+        is None
+    )
 
 
 STICKY = CudaFault(700, True, "NONE")

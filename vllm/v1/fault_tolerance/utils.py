@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from abc import ABC, abstractmethod
 from collections.abc import Iterator
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from typing import Any, ClassVar
 
 import msgspec
@@ -42,11 +42,16 @@ class DeviceFault(ABC):
     Each accelerator backend subclasses this, sets `backend`, and may add
     fields. `error_code` is defined by the backend, as are the values of
     `recovery_action`. The engine reads only `restart_required` and passes
-    `to_dict()` through to the status API, which can be reached without an API
-    key. Keep hardware identifiers such as a device UUID out of the fields.
+    `to_dict()` through to the status API.
+
+    The status API is open to any client when the server has no API key, so
+    `to_dict()` publishes only the fields a backend names in `status_fields`.
+    A field that is not named stays inside the process. Do not name a
+    hardware identifier such as a device UUID.
     """
 
     backend: ClassVar[str]
+    status_fields: ClassVar[tuple[str, ...]]
 
     error_code: int
     sticky: bool
@@ -60,6 +65,16 @@ class DeviceFault(ABC):
             raise TypeError(f"{cls.__name__} must set `backend`")
         if cls.restart_required is DeviceFault.restart_required:
             raise TypeError(f"{cls.__name__} must define `restart_required`")
+        if not isinstance(getattr(cls, "status_fields", None), tuple):
+            raise TypeError(f"{cls.__name__} must set `status_fields`")
+        declared = {
+            name
+            for base in cls.__mro__
+            for name in getattr(base, "__annotations__", {})
+        }
+        unknown = [name for name in cls.status_fields if name not in declared]
+        if unknown:
+            raise TypeError(f"{cls.__name__} publishes unknown fields: {unknown}")
 
     @property
     @abstractmethod
@@ -69,7 +84,7 @@ class DeviceFault(ABC):
     def to_dict(self) -> dict[str, Any]:
         return (
             {"backend": self.backend}
-            | asdict(self)
+            | {name: getattr(self, name) for name in self.status_fields}
             | {"restart_required": self.restart_required}
         )
 
