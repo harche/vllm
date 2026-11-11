@@ -70,6 +70,7 @@ from vllm.utils.watch_dog import get_watch_dog, start_watch_dog
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 from vllm.v1.executor.abstract import Executor, FailureCallback
 from vllm.v1.executor.vllm_net_devices import set_worker_net_device
+from vllm.v1.fault_tolerance.utils import DeviceFault
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
     DraftTokenIds,
@@ -84,9 +85,48 @@ logger = init_logger(__name__)
 class ExceptionWithKVConnectorOutput(Exception):
     """Carries a worker's KV connector output along with its failure."""
 
-    def __init__(self, error_msg: str, kv_connector_output: KVConnectorOutput | None):
+    def __init__(
+        self,
+        error_msg: str,
+        kv_connector_output: KVConnectorOutput | None,
+        device_fault: DeviceFault | None = None,
+    ):
         super().__init__(error_msg)
         self.kv_connector_output = kv_connector_output
+        self.device_fault = device_fault
+
+
+@dataclass
+class WorkerFailure:
+    """A worker's failure response.
+
+    Carries the error text, the worker's device fault classification, and the
+    KV connector output of a failed step when there is one.
+    """
+
+    message: str
+    device_fault: DeviceFault | None = None
+    kv_connector_output: KVConnectorOutput | None = None
+
+    def __str__(self) -> str:
+        return self.message
+
+
+class WorkerFailedError(RuntimeError):
+    """One or more workers failed; carries their device fault classifications.
+
+    The fault tolerance status starts `fault_info` with the class name of the
+    error, so this name is what a client sees for a worker failure. Renaming
+    the class changes that output.
+    """
+
+    def __init__(self, message: str, device_faults: list[DeviceFault]):
+        super().__init__(message)
+        self.device_faults = device_faults
+
+    def __reduce__(self):
+        # The default rebuilds the error from its message alone.
+        return type(self), (str(self), self.device_faults)
 
 
 class FutureWrapper(Future):
@@ -522,6 +562,7 @@ class MultiprocExecutor(Executor):
         def get_response():
             responses = []
             has_failure = False
+            device_faults: list[DeviceFault] = []
 
             for mq in response_mqs:
                 dequeue_timeout = (
@@ -532,23 +573,32 @@ class MultiprocExecutor(Executor):
                 except TimeoutError as e:
                     raise TimeoutError(f"RPC call to {method} timed out.") from e
 
+                if status != WorkerProc.ResponseStatus.SUCCESS:
+                    fault = getattr(result, "device_fault", None)
+                    if fault is not None:
+                        device_faults.append(fault)
+
                 if status == WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT:
                     if (
                         not self.vllm_config.parallel_config.enable_fault_tolerance
                         or self.is_failed
                     ):
-                        raise RuntimeError("Worker failed with KV connector output")
+                        raise WorkerFailedError(
+                            "Worker failed with KV connector output", device_faults
+                        )
                     has_failure = True
-                    assert isinstance(result, KVConnectorOutput)
-                    responses.append(result)
+                    assert isinstance(result, WorkerFailure)
+                    assert result.kv_connector_output is not None
+                    responses.append(result.kv_connector_output)
                 elif status != WorkerProc.ResponseStatus.SUCCESS:
                     if (
                         not self.vllm_config.parallel_config.enable_fault_tolerance
                         or self.is_failed
                     ):
-                        raise RuntimeError(
+                        raise WorkerFailedError(
                             f"Worker failed with error '{result}', please check the"
-                            " stack trace above for the root cause"
+                            " stack trace above for the root cause",
+                            device_faults,
                         )
                     has_failure = True
                 else:
@@ -569,7 +619,7 @@ class MultiprocExecutor(Executor):
                         kv_connector_outputs
                     )
 
-                raise RuntimeError("One or more workers failed")
+                raise WorkerFailedError("One or more workers failed", device_faults)
 
             return responses[0] if output_rank is not None else responses
 
@@ -1142,21 +1192,35 @@ class WorkerProc:
                     kv_connector_output is not None
                     and not kv_connector_output.is_empty()
                 ):
-                    output = ExceptionWithKVConnectorOutput(str(e), kv_connector_output)
+                    output = ExceptionWithKVConnectorOutput(
+                        str(e), kv_connector_output, self._classify_fault(e)
+                    )
                 else:
                     output = e
 
         if isinstance(output, ExceptionWithKVConnectorOutput):
             result: tuple[WorkerProc.ResponseStatus, Any] = (
                 WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT,
-                output.kv_connector_output,
+                WorkerFailure(
+                    str(output), output.device_fault, output.kv_connector_output
+                ),
             )
         elif isinstance(output, Exception):
-            result = (WorkerProc.ResponseStatus.FAILURE, str(output))
+            result = (
+                WorkerProc.ResponseStatus.FAILURE,
+                WorkerFailure(str(output), self._classify_fault(output)),
+            )
         else:
             result = (WorkerProc.ResponseStatus.SUCCESS, output)
         if (response_mq := self.worker_response_mq) is not None:
             response_mq.enqueue(result)
+
+    def _classify_fault(self, exc: Exception) -> DeviceFault | None:
+        try:
+            return self.worker.classify_fault(exc)
+        except Exception:
+            logger.warning("Device fault classification failed", exc_info=True)
+            return None
 
     def handle_output(self, output: Any):
         """Handles output from the worker. If async scheduling is enabled,

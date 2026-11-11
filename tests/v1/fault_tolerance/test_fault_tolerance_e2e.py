@@ -40,8 +40,10 @@ NUM_REDUNDANT_EXPERTS = 64
 SCALE_DOWN_DEADLINE_S = 20
 
 
-# Patches ``gpu.dp_utils.sync_cudagraph_and_dp_padding`` to raise on ``rank``
+# Patches ``gpu.dp_utils.sync_cudagraph_and_dp_padding`` to fault on ``rank``
 # once armed (via /collective_rpc). Gated on VLLM_FT_TEST_INJECT_FAULT.
+# ``kind=raise`` raises a Python exception. ``kind=cuda_assert`` triggers a
+# device-side assert, a sticky CUDA error, on the worker's GPU.
 _FAULT_INJECT_SITECUSTOMIZE = """\
 import builtins
 import os
@@ -55,7 +57,18 @@ _WORKER_MODULE = "vllm.v1.worker.gpu_worker"
 if _SPEC:
     _f = dict(kv.split("=", 1) for kv in _SPEC.split(","))
     _RANK = int(_f["rank"])
+    _KIND = _f.get("kind", "raise")
     _ARMED = [False]
+
+    def _fault():
+        if _KIND == "cuda_assert":
+            import torch
+
+            # Each engine sees only its own GPU, so this is the worker's device.
+            x = torch.zeros(4, device="cuda")
+            x[torch.tensor([100], device="cuda")]
+            torch.accelerator.synchronize()
+        raise RuntimeError("FT test fault injection (rank=%d)" % _RANK)
 
     def _arm():
         _ARMED[0] = True
@@ -74,7 +87,7 @@ if _SPEC:
                 if not _ARMED[0]:
                     return result
                 _ARMED[0] = False
-                raise RuntimeError("FT test fault injection (rank=%d)" % _RANK)
+                _fault()
             return result
 
         setattr(m, _ATTR, _wrapped)
@@ -108,8 +121,10 @@ if _SPEC:
 """
 
 
-def _install_fault_injection(monkeypatch, tmp_path, rank: int) -> None:
-    """Install a sitecustomize that raises on `rank` once armed.
+def _install_fault_injection(
+    monkeypatch, tmp_path, rank: int, kind: str = "raise"
+) -> None:
+    """Install a sitecustomize that faults on `rank` once armed.
 
     Disarmed until the test calls /collective_rpc (needs VLLM_SERVER_DEV_MODE,
     set here).
@@ -122,7 +137,7 @@ def _install_fault_injection(monkeypatch, tmp_path, rank: int) -> None:
         "PYTHONPATH",
         str(site_dir) + (os.pathsep + existing if existing else ""),
     )
-    monkeypatch.setenv("VLLM_FT_TEST_INJECT_FAULT", f"rank={rank}")
+    monkeypatch.setenv("VLLM_FT_TEST_INJECT_FAULT", f"rank={rank},kind={kind}")
     monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "1")
 
 
@@ -406,7 +421,9 @@ def test_injected_fault_retry_recovers_all_ranks(monkeypatch, tmp_path):
         faulted = _drive_to_faulted(servers_by_rank, match_values={"unhealthy"})
 
         # The rank that raised carries the fault info from its own exception.
+        # A Python exception is not a device fault, so the rank stays retryable.
         assert faulted[faulted_rank].get("fault_info"), faulted[faulted_rank]
+        assert "device_fault" not in faulted[faulted_rank], faulted[faulted_rank]
 
         # 4. retry every engine.
         round_id = str(uuid.uuid4())
@@ -531,3 +548,93 @@ def test_scale_down_removes_dead_rank_and_recovers(quantization):
             f"(diff: {recovered_accuracy - initial_accuracy:+.3f})\n"
             f"  Tolerance:        {ACCURACY_TOL:.3f}"
         )
+
+
+@pytest.mark.skipif(not has_nixl_ep(), reason="Requires nixl_ep all2all backend")
+@multi_gpu_test(num_gpus=4)
+def test_sticky_device_fault_reports_dead_and_scales_down(monkeypatch, tmp_path):
+    """A sticky CUDA error makes the rank DEAD, so it is removed, not retried.
+
+    A device-side assert is injected into rank 0's worker. CUDA documents the
+    error as requiring the process to be relaunched, so `retry` cannot succeed
+    on that rank. The engine must report `dead` with the worker's
+    classification while its process is still running, and the survivors must
+    recover with `scale_down`.
+    """
+    dp_size = 4
+    victim_rank = 0
+    _install_fault_injection(monkeypatch, tmp_path, victim_rank, kind="cuda_assert")
+    eplb_args = [
+        "--enable-eplb",
+        "--eplb-config.num_redundant_experts",
+        str(NUM_REDUNDANT_EXPERTS),
+    ]
+    with _ft_manager(eplb_args, dp_size=dp_size) as servers:
+        assert len(servers) == dp_size
+        servers_by_rank = _servers_by_rank(servers, dp_size)
+        victim = servers_by_rank[victim_rank]
+        survivor_ranks = [r for r in servers_by_rank if r != victim_rank]
+        survivors = [servers_by_rank[r] for r in survivor_ranks]
+
+        # 1. All engines healthy and serving.
+        _assert_serving_and_healthy(list(servers_by_rank.values()))
+
+        # 2. Arm, then drive: the victim's worker hits the device-side assert.
+        _arm_ft_injection(list(servers_by_rank.values()))
+        faulted = _drive_to_faulted(servers_by_rank, match_values={"dead", "unhealthy"})
+
+        # 3. The victim reports DEAD with the worker's classification.
+        status = faulted[victim_rank]
+        assert status["status"] == "dead", status
+        device_fault = dict(status["device_fault"])
+        # The recovery action is null on a driver that does not report one.
+        assert device_fault.pop("recovery_action") in ("NONE", None), status
+        assert device_fault == {
+            "backend": "cuda",
+            "error_code": 710,
+            "sticky": True,
+            "driver_error": None,
+            "restart_required": True,
+        }, status
+        assert status["fault_info"].endswith("; restart required"), status
+        for rank in survivor_ranks:
+            assert faulted[rank]["status"] == "unhealthy", faulted[rank]
+            assert "device_fault" not in faulted[rank], faulted[rank]
+
+        # 4. The DEAD engine rejects retry.
+        _apply_ft(victim, "retry")
+        ft_error = _wait_for_ft_failure(victim, FAULT_DETECTION_DEADLINE_S)
+        assert ft_error is not None, (
+            "rejection was never recorded in /v1/fault_tolerance/status"
+        )
+        assert "status is DEAD" in ft_error, ft_error
+
+        # 5. scale_down sent to every survivor: remove the dead rank.
+        round_id = str(uuid.uuid4())
+        store_port = get_open_port()
+        for server in survivors:
+            _apply_ft(
+                server,
+                "scale_down",
+                {
+                    "removed_dp_ranks": [victim_rank],
+                    "dp_store_port": store_port,
+                    "dp_master_ip": "127.0.0.1",
+                },
+                request_id=round_id,
+            )
+
+        # 6. Recovery completes: all survivors are healthy and serving.
+        recovered = _wait_for_engines(
+            survivors,
+            match_key="status",
+            match_values={"healthy"},
+            deadline_s=SCALE_DOWN_DEADLINE_S,
+        )
+        for rank, engine_status in zip(survivor_ranks, recovered):
+            assert engine_status is not None, (
+                f"survivor {rank} did not recover within {SCALE_DOWN_DEADLINE_S}s"
+            )
+        for server in survivors:
+            completion = _complete(server.get_client())
+            assert completion.choices[0].text

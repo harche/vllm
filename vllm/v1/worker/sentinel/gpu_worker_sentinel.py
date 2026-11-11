@@ -27,8 +27,9 @@ from vllm.distributed.utils import (
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.all2all_utils import get_ep_all2all_manager
+from vllm.platforms import current_platform
 from vllm.utils.network_utils import get_ip
-from vllm.v1.fault_tolerance.utils import FaultToleranceRequest
+from vllm.v1.fault_tolerance.utils import DeviceFault, FaultToleranceRequest
 from vllm.v1.serial_utils import run_method
 from vllm.v1.worker.sentinel.eplb_redistribute import (
     compute_dead_ep_ranks,
@@ -89,6 +90,7 @@ class WorkerSentinel:
 
     def __init__(self, worker: "Worker"):
         self.worker = worker
+        self.device_uuid: str | None = None
         all2all_backend = worker.parallel_config.all2all_backend
         if all2all_backend not in FT_BACKEND_SET:
             raise ValueError(
@@ -106,6 +108,36 @@ class WorkerSentinel:
             raise ValueError("Fault tolerance does not support MoE draft models yet.")
         if worker.parallel_config.prefill_context_parallel_size > 1:
             raise ValueError("Fault tolerance does not support PCP yet.")
+
+    def classify_fault(self, exc: BaseException) -> DeviceFault | None:
+        """Classify an exception raised by this worker; None if it is not a
+        device fault. The engine reports the result in its status.
+
+        What an error means is specific to the accelerator, so the platform
+        decides. See `Platform.classify_device_fault`.
+        """
+        device = self.worker.device
+        if device is None or device.index is None:
+            # The worker failed before it was given a device.
+            return None
+        # `device.index` was resolved at startup. See
+        # `CudaPlatformBase.probe_device_context` for why it is not looked up
+        # again here.
+        fault = current_platform.classify_device_fault(
+            exc, self.worker.local_rank, device.index
+        )
+        if fault is not None:
+            # The device UUID stays in the log. The status API omits it.
+            logger.error("Worker hit a %s on device %s", fault, self.device_uuid)
+        return fault
+
+    def record_device_uuid(self) -> None:
+        """Read the device UUID once the worker has its device. A device that
+        is lost later cannot report it, so the fault log uses this copy."""
+        try:
+            self.device_uuid = current_platform.get_device_uuid(self.worker.local_rank)
+        except Exception:
+            logger.debug("Device UUID is not available", exc_info=True)
 
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""

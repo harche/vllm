@@ -415,6 +415,58 @@ report `unhealthy`. Include the original rank IDs in `removed_dp_ranks`. If the
 removed rank hosted the DP store, also provide a reachable surviving
 `dp_master_ip` and a free `dp_store_port`.
 
+An engine that cannot recover in place reports `dead` and accepts no
+instructions. This includes an engine whose worker hit a device fault that
+needs a process restart. In that case the status carries a `device_fault`
+object next to `fault_info`:
+
+```json
+{
+  "status": "dead",
+  "fault_info": "WorkerFailedError: device fault: backend=cuda error_code=700 sticky=True recovery_action=NONE driver_error=None; restart required",
+  "device_fault": {
+    "backend": "cuda",
+    "error_code": 700,
+    "sticky": true,
+    "recovery_action": "NONE",
+    "driver_error": null,
+    "restart_required": true
+  }
+}
+```
+
+- `backend` names the accelerator backend that classified the fault. It
+  defines the meaning of `error_code` and the values of `recovery_action`.
+  `cuda` is the only backend that reports faults today.
+- `error_code` is the backend's code for the failed operation. For `cuda` it is
+  the CUDA error code. `sticky` is true for the codes that CUDA documents as
+  requiring the process to be terminated and relaunched, such as 700 (illegal
+  address) and 710 (device-side assert).
+- `recovery_action` is what the device driver says the device needs. For `cuda`
+  it is the NVML GPU recovery action: `NONE`, `GPU_RESET`, `NODE_REBOOT`,
+  `DRAIN_P2P`, `DRAIN_AND_RESET`, `RECOVER_IMEX_DOMAIN`, `BUS_RESET` or
+  `SYSTEM_REBOOT`. An action newer than this list is reported as its number.
+  The field is `null` when NVML is unavailable, and when `driver_error` is set.
+- `driver_error` is reported by the `cuda` backend. It is `GPU_IS_LOST` when
+  NVML answers that the GPU "has fallen off the bus or has otherwise become
+  inaccessible", `RESET_REQUIRED` when NVML answers that the GPU "requires a
+  reset before it can be used again", and `null` otherwise. Such a device
+  reports no recovery action.
+- `restart_required` is true when the error is sticky, when `driver_error` is
+  set, or when the recovery action takes the device away from the process.
+  `NONE`, `RECOVER_IMEX_DOMAIN` and an action reported as a number do not
+  require a restart.
+
+Remove a rank that reports `dead` with `scale_down` on the survivors, and do
+not send it `retry`. A device fault that does not require a restart is
+reported with `unhealthy` and the same `device_fault` object. The status does not
+identify the device; the worker writes the device UUID to the server log.
+
+`device_fault` records what was known when the fault happened and is not
+updated afterwards. It helps choose between `retry` and `scale_down`; it is not
+a live health signal. An `unhealthy` engine stays `unhealthy` until a `retry` or
+`scale_down` succeeds, and a successful `retry` returns it to `healthy`.
+
 Scale-down restores service with fewer ranks; it does not restart the removed
 engines or restore their capacity. The previous `/fault_tolerance/apply`
 endpoint is no longer registered.

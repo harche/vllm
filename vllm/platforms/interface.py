@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backends.mla.prefill.base import MLAPrefillBackend
     from vllm.v1.attention.backends.mla.prefill.selector import MLAPrefillSelectorConfig
     from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm.v1.fault_tolerance.utils import DeviceFault
 else:
     FlexibleArgumentParser = object
 
@@ -611,6 +612,24 @@ class Platform:
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         """Get the total memory of a device in bytes."""
         raise NotImplementedError
+
+    @classmethod
+    def classify_device_fault(
+        cls, exc: BaseException, device_id: int, visible_device_id: int
+    ) -> "DeviceFault | None":
+        """Classify an exception raised by a worker on its device.
+
+        Fault tolerance reports the result in the engine status, so an
+        orchestrator can tell a fault that needs a process restart from one
+        that can be retried. Return None when `exc` is not a device fault.
+        A platform that does not classify faults keeps this default.
+
+        `device_id` is the worker's logical device ID. `visible_device_id` is
+        the ordinal the worker gave to torch at startup. The caller passes
+        both because mapping one to the other can need the device driver,
+        which may not answer after a fault.
+        """
+        return None
 
     @classmethod
     def get_all_gpu_pci_bus_ids(cls) -> dict[int, str]:

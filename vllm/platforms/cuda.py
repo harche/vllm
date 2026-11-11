@@ -35,6 +35,8 @@ if TYPE_CHECKING:
     from vllm.config.kernel import IrOpPriorityConfig
     from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.selector import AttentionSelectorConfig
+    from vllm.v1.fault_tolerance.cuda_fault import CudaDeviceState
+    from vllm.v1.fault_tolerance.utils import DeviceFault
 else:
     VllmConfig = None
     CacheDType = None
@@ -193,6 +195,16 @@ class _BackendCandidate(NamedTuple):
     priority: int
 
 
+def _nvml_restart_error(nvml_return: int) -> str | None:
+    """The `RESTART_DRIVER_ERRORS` name for an NVML return code, or None."""
+    from vllm.v1.fault_tolerance.cuda_fault import RESTART_DRIVER_ERRORS
+
+    for name in RESTART_DRIVER_ERRORS:
+        if nvml_return == getattr(pynvml, f"NVML_ERROR_{name}"):
+            return name
+    return None
+
+
 def with_nvml_context(fn: Callable[_P, _R]) -> Callable[_P, _R]:
     @wraps(fn)
     def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> _R:
@@ -336,6 +348,39 @@ class CudaPlatformBase(Platform):
     @classmethod
     def get_device_total_memory(cls, device_id: int = 0) -> int:
         raise NotImplementedError
+
+    @classmethod
+    def get_device_fault_state(cls, device_id: int = 0) -> CudaDeviceState:
+        """What the driver reports about a device after a fault. Without NVML
+        nothing is known, and the CUDA error class alone decides."""
+        from vllm.v1.fault_tolerance.cuda_fault import CudaDeviceState
+
+        return CudaDeviceState()
+
+    @classmethod
+    def classify_device_fault(
+        cls, exc: BaseException, device_id: int, visible_device_id: int
+    ) -> DeviceFault | None:
+        from vllm.v1.fault_tolerance.cuda_fault import classify_cuda_fault
+
+        return classify_cuda_fault(
+            exc,
+            lambda: cls.get_device_fault_state(device_id),
+            lambda: cls.probe_device_context(visible_device_id),
+        )
+
+    @classmethod
+    def probe_device_context(cls, visible_device_id: int) -> None:
+        """Make one call into the CUDA runtime on the device. It raises the
+        sticky error if one has left the context unusable.
+
+        The device is named by the ordinal the worker gave to torch at
+        startup, not by its logical ID. Mapping a logical ID goes through
+        NVML when CUDA_VISIBLE_DEVICES lists device UUIDs, and NVML fails
+        that lookup for a lost device. The probe would then fail before it
+        reached CUDA, and the fault would go unclassified.
+        """
+        torch.accelerator.synchronize(visible_device_id)
 
     @classmethod
     def is_fully_connected(cls, device_ids: list[int]) -> bool:
@@ -839,6 +884,55 @@ class NvmlCudaPlatform(CudaPlatformBase):
         physical_device_id = cls.device_id_to_physical_device_id(device_id)
         handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
         return pynvml.nvmlDeviceGetUUID(handle)
+
+    @classmethod
+    def get_device_fault_state(cls, device_id: int = 0) -> CudaDeviceState:
+        from vllm.v1.fault_tolerance.cuda_fault import CudaDeviceState
+
+        try:
+            return cls._query_nvml_fault_state(device_id)
+        except pynvml.NVMLError as e:
+            # A device that has fallen off the bus, or that needs a reset,
+            # answers no query, so it never reports a recovery action. NVML
+            # says so with an error from whichever call touches the device
+            # first, including nvmlInit. Report it, or the fault would look
+            # retryable.
+            driver_error = _nvml_restart_error(e.value)
+            if driver_error is not None:
+                return CudaDeviceState(driver_error=driver_error)
+            logger.warning("NVML device state query failed", exc_info=True)
+        except Exception:
+            logger.warning("NVML device state query failed", exc_info=True)
+        # Classifying a fault must not raise a second one. When the driver
+        # cannot be asked, the CUDA error class alone decides.
+        return CudaDeviceState()
+
+    @classmethod
+    @with_nvml_context
+    def _query_nvml_fault_state(cls, device_id: int) -> CudaDeviceState:
+        from vllm.v1.fault_tolerance.cuda_fault import (
+            CudaDeviceState,
+            nvml_recovery_action_name,
+        )
+
+        # The driver is asked once, when the fault is classified. A recovery
+        # action it sets later is not seen. Waiting for one would delay every
+        # fault by a guessed interval, and a rank that cannot recover still
+        # ends when the engine's recovery timeout expires.
+        physical_device_id = cls.device_id_to_physical_device_id(device_id)
+        handle = pynvml.nvmlDeviceGetHandleByIndex(physical_device_id)
+        field = pynvml.nvmlDeviceGetFieldValues(
+            handle, [pynvml.NVML_FI_DEV_GET_GPU_RECOVERY_ACTION]
+        )[0]
+        driver_error = _nvml_restart_error(field.nvmlReturn)
+        if driver_error is not None:
+            return CudaDeviceState(driver_error=driver_error)
+        if field.nvmlReturn != pynvml.NVML_SUCCESS:
+            # The driver does not support the field.
+            return CudaDeviceState()
+        return CudaDeviceState(
+            recovery_action=nvml_recovery_action_name(field.value.uiVal)
+        )
 
     @classmethod
     @with_nvml_context

@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
 import asyncio
+import copy
 import os
 from collections import deque
 from collections.abc import Callable
@@ -22,11 +23,17 @@ from vllm.v1.engine.async_llm import AsyncLLM
 from vllm.v1.engine.llm_engine import LLMEngine
 from vllm.v1.executor import multiproc_executor as multiproc_executor_module
 from vllm.v1.executor.abstract import Executor
-from vllm.v1.executor.multiproc_executor import MultiprocExecutor, WorkerProc
+from vllm.v1.executor.multiproc_executor import (
+    MultiprocExecutor,
+    WorkerFailedError,
+    WorkerFailure,
+    WorkerProc,
+)
 from vllm.v1.executor.uniproc_executor import (
     ExecutorWithExternalLauncher,
     UniProcExecutor,
 )
+from vllm.v1.fault_tolerance.cuda_fault import CudaFault
 from vllm.v1.outputs import ModelRunnerOutput
 
 
@@ -235,7 +242,12 @@ def _make_failed_step_executor(enable_ft: bool) -> MultiprocExecutor:
             [
                 (
                     WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT,
-                    KVConnectorOutput(finished_recving={"req1"}, invalid_block_ids={7}),
+                    WorkerFailure(
+                        "step failed",
+                        kv_connector_output=KVConnectorOutput(
+                            finished_recving={"req1"}, invalid_block_ids={7}
+                        ),
+                    ),
                 )
             ]
         ),
@@ -320,3 +332,49 @@ def test_ft_rpc_failure_keeps_next_rpc_responses_aligned(
         "recovered0",
         "recovered1",
     ]
+
+
+@pytest.mark.parametrize("enable_ft", [True, False])
+@pytest.mark.parametrize(
+    "status, kv_connector_output",
+    [
+        (WorkerProc.ResponseStatus.FAILURE, None),
+        (
+            WorkerProc.ResponseStatus.FAILURE_WITH_KV_OUTPUT,
+            KVConnectorOutput(finished_recving={"req1"}),
+        ),
+    ],
+)
+def test_worker_failure_carries_device_fault(enable_ft, status, kv_connector_output):
+    """The engine must see each worker's device fault on every failure path,
+    not only an error string."""
+    fault = CudaFault(error_code=700, sticky=True)
+    executor = _make_failed_step_executor(enable_ft=enable_ft)
+    executor.response_mqs = [
+        _FakeResponseMQ(
+            [(status, WorkerFailure("illegal", fault, kv_connector_output))]
+        ),
+        _FakeResponseMQ([(WorkerProc.ResponseStatus.SUCCESS, None)]),
+    ]
+
+    with pytest.raises(WorkerFailedError) as exc_info:
+        executor.collective_rpc("execute_model")
+
+    assert exc_info.value.device_faults == [fault]
+    assert executor.classify_fault(exc_info.value) == [fault]
+
+    # The classification survives an error raised from the worker failure.
+    try:
+        raise RuntimeError("step failed") from exc_info.value
+    except RuntimeError as wrapped:
+        assert executor.classify_fault(wrapped) == [fault]
+
+
+def test_worker_failed_error_can_be_rebuilt():
+    """Copying and pickling both rebuild an exception through `__reduce__`."""
+    fault = CudaFault(error_code=700, sticky=True)
+
+    restored = copy.deepcopy(WorkerFailedError("illegal", [fault]))
+
+    assert str(restored) == "illegal"
+    assert restored.device_faults == [fault]

@@ -31,8 +31,11 @@ from vllm.v1.engine import (
 )
 from vllm.v1.fault_tolerance.utils import (
     ALLOWED_FT_INSTRUCTIONS,
+    DeviceFault,
     FaultToleranceRequest,
     FaultToleranceResult,
+    describe_fault,
+    select_device_fault,
 )
 from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import RequestStatus
@@ -65,6 +68,7 @@ class EngineCoreSentinel:
         self.resumed.set()
         self.status_type = EngineStatusType.HEALTHY
         self.fault_info: str | None = None
+        self.device_fault: DeviceFault | None = None
         self._initial_dp_size = parallel_config.data_parallel_size
         self._dead_dp_ranks: set[int] = set()
         self._recovery_store: TCPStore | None = None
@@ -149,7 +153,17 @@ class EngineCoreSentinel:
         aborted = engine.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
         engine._send_abort_outputs(aborted)
 
-        if (
+        # The workers classify the fault. The engine only reads whether a
+        # restart is required and passes the classification through.
+        self.device_fault = select_device_fault(
+            engine.model_executor.classify_fault(exc)
+        )
+        self.fault_info = describe_fault(exc, self.device_fault)
+
+        # When a restart is required, recovery in place cannot succeed, so the
+        # engine reports DEAD and does not offer retry.
+        restart = self.device_fault is not None and self.device_fault.restart_required
+        if restart or (
             hasattr(engine.model_executor, "is_failed")
             and engine.model_executor.is_failed
         ):
@@ -167,7 +181,6 @@ class EngineCoreSentinel:
             # on_executor_failed may have set DEAD concurrently.
             if self.status_type == EngineStatusType.DIAGNOSING:
                 self.status_type = EngineStatusType.UNHEALTHY
-        self.fault_info = f"{type(exc).__name__}"
         logger.info(
             "[FT] Engine %d status -> %s:",
             self.engine_index,
@@ -235,10 +248,12 @@ class EngineCoreSentinel:
     def _push_status(self, mask: list[int] | None = None):
         """Push current health to the client so it can refresh its cache."""
         payload = {"id": self.engine_index, "status": self.status_type.name.lower()}
-        if self.status_type == EngineStatusType.UNHEALTHY:
+        if self.status_type in (EngineStatusType.UNHEALTHY, EngineStatusType.DEAD):
             payload["fault_info"] = self.fault_info
-            if mask is not None:
-                payload["mask"] = mask
+            if self.device_fault is not None:
+                payload["device_fault"] = self.device_fault.to_dict()
+        if self.status_type == EngineStatusType.UNHEALTHY and mask is not None:
+            payload["mask"] = mask
         outputs = EngineCoreOutputs(
             utility_output=UtilityOutput(
                 call_id=FT_STATUS_CALL_ID,

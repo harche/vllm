@@ -27,6 +27,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 if TYPE_CHECKING:
     from vllm.distributed.kv_transfer.kv_connector.base import KVConnectorBase
+    from vllm.v1.fault_tolerance.utils import DeviceFault
 
 logger = init_logger(__name__)
 
@@ -367,6 +368,18 @@ class Executor(ABC):
         """Checks if the executor is healthy. If not, it should raise an
         exception."""
         raise NotImplementedError
+
+    def classify_fault(self, exc: BaseException) -> list["DeviceFault"]:
+        """The workers' device fault classifications for an exception raised
+        by this executor, or for one raised from it."""
+        from vllm.v1.fault_tolerance.utils import exception_chain
+
+        # The error may be wrapped in another before the engine handles it.
+        # Reading only `exc` would then lose the classification silently.
+        for cur in exception_chain(exc):
+            if hasattr(cur, "device_faults"):
+                return list(cur.device_faults)
+        return []
 
     def shutdown(self) -> None:
         """Shutdown the executor."""
