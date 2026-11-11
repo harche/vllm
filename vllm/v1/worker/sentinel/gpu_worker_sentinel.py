@@ -91,6 +91,7 @@ class WorkerSentinel:
     def __init__(self, worker: "Worker"):
         self.worker = worker
         self.device_uuid: str | None = None
+        self.device_fault: DeviceFault | None = None
         all2all_backend = worker.parallel_config.all2all_backend
         if all2all_backend not in FT_BACKEND_SET:
             raise ValueError(
@@ -109,12 +110,14 @@ class WorkerSentinel:
         if worker.parallel_config.prefill_context_parallel_size > 1:
             raise ValueError("Fault tolerance does not support PCP yet.")
 
-    def classify_fault(self, exc: BaseException) -> DeviceFault | None:
+    def classify_fault(self, exc: BaseException | None) -> DeviceFault | None:
         """Classify an exception raised by this worker; None if it is not a
-        device fault. The engine reports the result in its status.
+        device fault. With no exception, report a fault the device holds that
+        has not reached Python yet.
 
         What an error means is specific to the accelerator, so the platform
-        decides. See `Platform.classify_device_fault`.
+        decides. See `Platform.classify_device_fault`. A backend without a
+        platform hook can override this method.
         """
         device = self.worker.device
         if device is None or device.index is None:
@@ -130,6 +133,30 @@ class WorkerSentinel:
             # The device UUID stays in the log. The status API omits it.
             logger.error("Worker hit a %s on device %s", fault, self.device_uuid)
         return fault
+
+    def record_fault(self, exc: BaseException) -> None:
+        """Classify an exception this worker raised and keep the result until
+        the engine asks for it with `query_device_fault`.
+
+        Every rank records its own fault. Only one rank replies to a model
+        step, so a fault on any other rank would not reach the engine with
+        the failed reply.
+        """
+        fault = self.classify_fault(exc)
+        if fault is None:
+            return
+        # A later error must not hide a fault that requires a restart.
+        if self.device_fault is None or not self.device_fault.restart_required:
+            self.device_fault = fault
+
+    def query_device_fault(self, ft_request: FaultToleranceRequest) -> dict:
+        """Hand the recorded device fault to the engine and clear it."""
+        fault, self.device_fault = self.device_fault, None
+        if fault is None:
+            # Device errors are reported asynchronously, so this worker's
+            # device may hold one that no call has raised yet.
+            fault = self.classify_fault(None)
+        return {"device_fault": fault}
 
     def record_device_uuid(self) -> None:
         """Read the device UUID once the worker has its device. A device that

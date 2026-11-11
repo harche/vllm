@@ -68,6 +68,27 @@ def test_execute_worker_rpc_returns_worker_exception():
     assert str(outputs[0]) == "test error"
 
 
+def test_execute_worker_rpc_records_fault_on_a_rank_that_does_not_reply():
+    """Only the reply rank sends its failure to the engine. Every other rank
+    has to record its own, or a fault on its device is never seen."""
+    error = RuntimeError("test error")
+
+    def fail():
+        raise error
+
+    worker_proc: Any = WorkerProc.__new__(WorkerProc)
+    worker_proc.rank = 1
+    recorded: list[Any] = []
+    worker_proc.worker = SimpleNamespace(fail=fail, record_fault=recorded.append)
+    outputs: list[Any] = []
+    worker_proc.handle_output = outputs.append
+
+    worker_proc._execute_worker_rpc(("fail", (), {}, 0))
+
+    assert outputs == []
+    assert recorded == [error]
+
+
 @pytest.mark.parametrize("stalled", [False, True])
 @pytest.mark.parametrize(
     "method,result",

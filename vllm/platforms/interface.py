@@ -615,9 +615,10 @@ class Platform:
 
     @classmethod
     def classify_device_fault(
-        cls, exc: BaseException, device_id: int, visible_device_id: int
+        cls, exc: BaseException | None, device_id: int, visible_device_id: int
     ) -> "DeviceFault | None":
-        """Classify an exception raised by a worker on its device.
+        """Classify an exception raised by a worker on its device. When `exc`
+        is None, report a fault the device holds that no call has raised yet.
 
         Fault tolerance reports the result in the engine status, so an
         orchestrator can tell a fault that needs a process restart from one

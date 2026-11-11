@@ -359,7 +359,7 @@ class CudaPlatformBase(Platform):
 
     @classmethod
     def classify_device_fault(
-        cls, exc: BaseException, device_id: int, visible_device_id: int
+        cls, exc: BaseException | None, device_id: int, visible_device_id: int
     ) -> DeviceFault | None:
         from vllm.v1.fault_tolerance.cuda_fault import classify_cuda_fault
 

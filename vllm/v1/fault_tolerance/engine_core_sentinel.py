@@ -153,17 +153,10 @@ class EngineCoreSentinel:
         aborted = engine.scheduler.finish_requests(None, RequestStatus.FINISHED_ABORTED)
         engine._send_abort_outputs(aborted)
 
-        # The workers classify the fault. The engine only reads whether a
-        # restart is required and passes the classification through.
-        self.device_fault = select_device_fault(
-            engine.model_executor.classify_fault(exc)
-        )
-        self.fault_info = describe_fault(exc, self.device_fault)
+        self.device_fault = None
+        self.fault_info = describe_fault(exc, None)
 
-        # When a restart is required, recovery in place cannot succeed, so the
-        # engine reports DEAD and does not offer retry.
-        restart = self.device_fault is not None and self.device_fault.restart_required
-        if restart or (
+        if (
             hasattr(engine.model_executor, "is_failed")
             and engine.model_executor.is_failed
         ):
@@ -173,14 +166,23 @@ class EngineCoreSentinel:
             # Push DIAGNOSING first. Commands are rejected until UNHEALTHY.
             self.status_type = EngineStatusType.DIAGNOSING
             self._push_status()
-            try:
-                mask = self._query_mask()
-            except Exception:
-                logger.warning("[FT] Failed to query mask for status push")
-                mask = None
-            # on_executor_failed may have set DEAD concurrently.
-            if self.status_type == EngineStatusType.DIAGNOSING:
-                self.status_type = EngineStatusType.UNHEALTHY
+            # The workers classify the fault. The engine only reads whether a
+            # restart is required and passes the classification through.
+            self.device_fault = self._query_device_fault()
+            self.fault_info = describe_fault(exc, self.device_fault)
+            mask = None
+            if self.device_fault is not None and self.device_fault.restart_required:
+                # Recovery in place cannot succeed, so the engine reports
+                # DEAD and does not offer retry.
+                self.status_type = EngineStatusType.DEAD
+            else:
+                try:
+                    mask = self._query_mask()
+                except Exception:
+                    logger.warning("[FT] Failed to query mask for status push")
+                # on_executor_failed may have set DEAD concurrently.
+                if self.status_type == EngineStatusType.DIAGNOSING:
+                    self.status_type = EngineStatusType.UNHEALTHY
         logger.info(
             "[FT] Engine %d status -> %s:",
             self.engine_index,
@@ -262,6 +264,27 @@ class EngineCoreSentinel:
         )
         outputs.engine_index = self.engine_index
         self.engine.output_queue.put_nowait((0, outputs))
+
+    def _query_device_fault(self) -> DeviceFault | None:
+        """The device fault this engine reports, chosen from what its workers
+        recorded.
+
+        Every worker is asked, because the worker whose device failed is not
+        always the one whose reply carried the failure. Without an answer
+        the fault stays unclassified.
+        """
+        ft_request = FaultToleranceRequest(instruction="query_device_fault", params={})
+        try:
+            results = self.engine.model_executor.collective_rpc(
+                "handle_ft_command",
+                args=(ft_request,),
+                timeout=self.engine_recovery_timeout_sec,
+            )
+        except Exception:
+            logger.warning("[FT] Failed to query device faults", exc_info=True)
+            return None
+        faults = [r["device_fault"] for r in results]
+        return select_device_fault([f for f in faults if f is not None])
 
     def _query_mask(self) -> list[int]:
         """Union of all workers' all2all masks.

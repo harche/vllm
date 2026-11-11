@@ -423,7 +423,7 @@ object next to `fault_info`:
 ```json
 {
   "status": "dead",
-  "fault_info": "WorkerFailedError: device fault: backend=cuda error_code=700 sticky=True recovery_action=NONE driver_error=None; restart required",
+  "fault_info": "RuntimeError: device fault: backend=cuda error_code=700 sticky=True recovery_action=NONE driver_error=None; restart required",
   "device_fault": {
     "backend": "cuda",
     "error_code": 700,
@@ -461,6 +461,11 @@ Remove a rank that reports `dead` with `scale_down` on the survivors, and do
 not send it `retry`. A device fault that does not require a restart is
 reported with `unhealthy` and the same `device_fault` object. The status does not
 identify the device; the worker writes the device UUID to the server log.
+
+Each worker classifies the errors on its own device, and the engine asks all
+of its workers while it reports `diagnosing`. A fault on any GPU of the engine
+is therefore reported, including one on a tensor-parallel rank other than the
+one that returns the step's output.
 
 `device_fault` records what was known when the fault happened and is not
 updated afterwards. It helps choose between `retry` and `scale_down`; it is not

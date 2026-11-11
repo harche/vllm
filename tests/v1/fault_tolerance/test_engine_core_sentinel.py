@@ -12,8 +12,6 @@ from unittest.mock import MagicMock
 from vllm.config import ParallelConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import KVConnectorOutput
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.executor.abstract import Executor
-from vllm.v1.executor.multiproc_executor import WorkerFailedError
 from vllm.v1.fault_tolerance.cuda_fault import CudaFault
 from vllm.v1.fault_tolerance.engine_core_sentinel import EngineCoreSentinel
 from vllm.v1.outputs import ModelRunnerOutput
@@ -75,23 +73,37 @@ def test_drain_batch_queue_drops_failures_and_empty_outputs():
 
 
 class _StubExecutor:
-    """Stands in for the engine's executor. It classifies with the real
-    `Executor.classify_fault` and answers the `query_mask` command."""
+    """Stands in for the engine's executor. It answers the two commands the
+    sentinel sends to the workers while it handles a fault, with one reply
+    per worker."""
 
-    classify_fault = Executor.classify_fault
-
-    def __init__(self, is_failed: bool):
+    def __init__(self, is_failed: bool, worker_faults: list[CudaFault | None]):
         self.is_failed = is_failed
+        self.worker_faults = worker_faults
+        self.instructions: list[str] = []
 
     def collective_rpc(self, method, args=(), timeout=None):
-        return [{"mask": [0, 0]}]
+        assert method == "handle_ft_command"
+        instruction = args[0].instruction
+        self.instructions.append(instruction)
+        if instruction == "query_device_fault":
+            if self.worker_faults is _NO_ANSWER:
+                raise TimeoutError("RPC call to handle_ft_command timed out.")
+            return [{"device_fault": fault} for fault in self.worker_faults]
+        return [{"mask": [0, 0]} for _ in self.worker_faults]
+
+
+# The workers do not answer the device fault query.
+_NO_ANSWER: list[CudaFault | None] = []
 
 
 def _make_fault_sentinel(
+    worker_faults: list[CudaFault | None],
     executor_failed: bool = False,
 ) -> tuple[EngineCoreSentinel, Callable[[], list[dict]]]:
     """A sentinel built by its real constructor around a stand-in engine, and
-    a reader for the statuses it pushes to the client.
+    a reader for the statuses it pushes to the client. `worker_faults` is
+    what each worker recorded, in rank order.
 
     The engine is a stand-in because a real `EngineCoreProc` needs model
     weights and a GPU per rank. `test_fault_tolerance_e2e.py` covers the same
@@ -101,7 +113,7 @@ def _make_fault_sentinel(
     engine = SimpleNamespace(
         engine_index=0,
         scheduler=MagicMock(),
-        model_executor=_StubExecutor(executor_failed),
+        model_executor=_StubExecutor(executor_failed, worker_faults),
         output_queue=output_queue,
         _send_abort_outputs=lambda aborted: None,
     )
@@ -117,47 +129,60 @@ def _make_fault_sentinel(
     return sentinel, pushed_statuses
 
 
-def _worker_failure(*faults: CudaFault) -> WorkerFailedError:
-    return WorkerFailedError("One or more workers failed", list(faults))
+STICKY = CudaFault(error_code=710, sticky=True, recovery_action="NONE")
+RETRYABLE = CudaFault(error_code=2, sticky=False, recovery_action="NONE")
 
 
 def test_fault_that_requires_a_restart_is_reported_dead():
     """Recovery in place cannot succeed, so the engine must not offer retry."""
-    fault = CudaFault(error_code=710, sticky=True, recovery_action="NONE")
-    sentinel, pushed_statuses = _make_fault_sentinel()
+    sentinel, pushed_statuses = _make_fault_sentinel([STICKY])
 
-    sentinel.on_fault(_worker_failure(fault))
+    sentinel.on_fault(RuntimeError("One or more workers failed"))
 
     assert pushed_statuses() == [
+        {"id": 0, "status": "diagnosing"},
         {
             "id": 0,
             "status": "dead",
-            "fault_info": f"WorkerFailedError: {fault}; restart required",
-            "device_fault": fault.to_dict(),
-        }
+            "fault_info": f"RuntimeError: {STICKY}; restart required",
+            "device_fault": STICKY.to_dict(),
+        },
     ]
+    # The mask is of no use to an engine that cannot recover.
+    assert sentinel.engine.model_executor.instructions == ["query_device_fault"]
+
+
+def test_fault_on_a_worker_that_did_not_reply_to_the_step_is_reported():
+    """Only one rank replies to a model step. A device fault on another
+    rank reaches the engine because every worker is asked."""
+    sentinel, pushed_statuses = _make_fault_sentinel([None, RETRYABLE, STICKY, None])
+
+    sentinel.on_fault(TimeoutError("RPC call to execute_model timed out."))
+
+    status = pushed_statuses()[-1]
+    assert status["status"] == "dead"
+    assert status["device_fault"] == STICKY.to_dict()
 
 
 def test_retryable_device_fault_is_reported_unhealthy_with_its_classification():
-    fault = CudaFault(error_code=2, sticky=False, recovery_action="NONE")
-    sentinel, pushed_statuses = _make_fault_sentinel()
+    sentinel, pushed_statuses = _make_fault_sentinel([RETRYABLE])
 
-    sentinel.on_fault(_worker_failure(fault))
+    sentinel.on_fault(RuntimeError("One or more workers failed"))
 
     assert pushed_statuses() == [
         {"id": 0, "status": "diagnosing"},
         {
             "id": 0,
             "status": "unhealthy",
-            "fault_info": f"WorkerFailedError: {fault}",
-            "device_fault": fault.to_dict(),
+            "fault_info": f"RuntimeError: {RETRYABLE}",
+            "device_fault": RETRYABLE.to_dict(),
             "mask": [0, 0],
         },
     ]
 
 
 def test_fault_that_is_not_a_device_fault_is_reported_without_a_classification():
-    sentinel, pushed_statuses = _make_fault_sentinel()
+    sentinel, pushed_statuses = _make_fault_sentinel([None, None])
 
     sentinel.on_fault(RuntimeError("boom"))
 
@@ -167,11 +192,34 @@ def test_fault_that_is_not_a_device_fault_is_reported_without_a_classification()
     ]
 
 
-def test_failed_executor_is_reported_dead_with_the_fault_info():
-    sentinel, pushed_statuses = _make_fault_sentinel(executor_failed=True)
+def test_fault_is_reported_unclassified_when_the_workers_do_not_answer():
+    sentinel, pushed_statuses = _make_fault_sentinel(_NO_ANSWER)
+
+    sentinel.on_fault(RuntimeError("boom"))
+
+    status = pushed_statuses()[-1]
+    assert status["status"] == "unhealthy"
+    assert status["fault_info"] == "RuntimeError"
+    assert "device_fault" not in status
+
+
+def test_classification_of_an_earlier_fault_is_not_reported_again():
+    sentinel, pushed_statuses = _make_fault_sentinel([RETRYABLE])
+    sentinel.on_fault(RuntimeError("first"))
+    pushed_statuses()
+
+    sentinel.engine.model_executor.worker_faults = [None]
+    sentinel.on_fault(RuntimeError("second"))
+
+    assert "device_fault" not in pushed_statuses()[-1]
+
+
+def test_failed_executor_is_reported_dead_without_asking_the_workers():
+    sentinel, pushed_statuses = _make_fault_sentinel([None], executor_failed=True)
 
     sentinel.on_fault(RuntimeError("boom"))
 
     assert pushed_statuses() == [
         {"id": 0, "status": "dead", "fault_info": "RuntimeError"}
     ]
+    assert sentinel.engine.model_executor.instructions == []

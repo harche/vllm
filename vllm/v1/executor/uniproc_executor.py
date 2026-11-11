@@ -30,9 +30,15 @@ logger = init_logger(__name__)
 
 
 class AsyncOutputFuture(Future):
-    def __init__(self, async_output: AsyncModelRunnerOutput, single_value: bool):
+    def __init__(
+        self,
+        async_output: AsyncModelRunnerOutput,
+        single_value: bool,
+        on_error: Callable[[Exception], None] | None = None,
+    ):
         self.async_output = async_output
         self.single_value = single_value
+        self.on_error = on_error
         super().__init__()
 
     def result(self, timeout=None):
@@ -44,6 +50,8 @@ class AsyncOutputFuture(Future):
                 output = self.async_output.get_output()
                 self.set_result(output if self.single_value else [output])
             except Exception as e:
+                if self.on_error is not None:
+                    self.on_error(e)
                 self.set_exception(e)
         return super().result()
 
@@ -100,21 +108,34 @@ class UniProcExecutor(Executor):
             kwargs = {}
 
         if not non_block:
-            result = run_method(self.driver_worker, method, args, kwargs)
-            if isinstance(result, AsyncModelRunnerOutput):
-                result = result.get_output()
+            try:
+                result = run_method(self.driver_worker, method, args, kwargs)
+                if isinstance(result, AsyncModelRunnerOutput):
+                    result = result.get_output()
+            except Exception as e:
+                self._record_fault(e)
+                raise
             return result if single_value else [result]
 
         try:
             result = run_method(self.driver_worker, method, args, kwargs)
             if isinstance(result, AsyncModelRunnerOutput):
-                return AsyncOutputFuture(result, single_value)
+                return AsyncOutputFuture(result, single_value, self._record_fault)
             future = Future[Any]()
             future.set_result(result if single_value else [result])
         except Exception as e:
+            self._record_fault(e)
             future = Future[Any]()
             future.set_exception(e)
         return future
+
+    def _record_fault(self, exc: Exception) -> None:
+        """Let the worker record a device fault, as `WorkerProc` does for a
+        worker that runs in its own process."""
+        try:
+            self.driver_worker.record_fault(exc)
+        except Exception:
+            logger.warning("Device fault classification failed", exc_info=True)
 
     def execute_model(  # type: ignore[override]
         self, scheduler_output: SchedulerOutput, non_block: bool = False

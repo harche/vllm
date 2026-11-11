@@ -175,6 +175,15 @@ def test_error_without_a_cuda_code_is_classified_from_the_context():
     assert fault.restart_required
 
 
+def test_fault_that_no_call_has_raised_yet_is_found_in_the_context():
+    """A worker asked for its fault may hold a device error that Python has
+    not seen, because device errors are reported asynchronously."""
+    fault = classify_cuda_fault(None, CudaDeviceState, _poisoned_context(710))
+
+    assert fault == CudaFault(error_code=710, sticky=True, recovery_action=None)
+    assert classify_cuda_fault(None, CudaDeviceState, _usable_context) is None
+
+
 def test_context_is_not_probed_when_the_error_has_a_cuda_code():
     def probe() -> None:
         raise AssertionError("probed")

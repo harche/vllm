@@ -137,21 +137,22 @@ def nvml_recovery_action_name(value: int) -> str:
 
 
 def classify_cuda_fault(
-    exc: BaseException,
+    exc: BaseException | None,
     get_device_state: Callable[[], CudaDeviceState],
     probe_context: Callable[[], None],
 ) -> CudaFault | None:
     """Classify `exc` as a CUDA fault; None if it is not one.
 
-    The error code comes from `exc`. When `exc` carries none, it comes from
-    `probe_context`, a call into the CUDA runtime: a sticky error is returned
-    by every later CUDA call in the process, so the probe finds one that first
-    surfaced without a code. cuBLAS, cuDNN and NCCL report failures that way.
+    The error code comes from `exc`. When `exc` carries none, or when there
+    is no exception, it comes from `probe_context`, a call into the CUDA
+    runtime: a sticky error is returned by every later CUDA call in the
+    process, so the probe finds one that first surfaced without a code.
+    cuBLAS, cuDNN and NCCL report failures that way.
 
     `get_device_state` asks the driver about the worker's device. It is
     called only when there is an error code.
     """
-    error_code = cuda_error_code(exc)
+    error_code = cuda_error_code(exc) if exc is not None else None
     if error_code is None:
         try:
             probe_context()

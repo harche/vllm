@@ -104,7 +104,6 @@ from vllm.utils.torch_utils import set_random_seed, set_torch_threads_for_runtim
 from vllm.utils.vmm_driver import vmm_unavailable_reason
 from vllm.v1.attention.backends.utils import record_kv_cache_layout
 from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
-from vllm.v1.fault_tolerance.utils import DeviceFault
 from vllm.v1.kv_cache_interface import KVCacheConfig, KVCacheSpec
 from vllm.v1.outputs import (
     AsyncModelRunnerOutput,
@@ -1615,10 +1614,9 @@ class Worker(WorkerBase):
         # worker will always be healthy as long as it's running.
         return
 
-    def classify_fault(self, exc: BaseException) -> DeviceFault | None:
-        if self.worker_sentinel is None:
-            return None
-        return self.worker_sentinel.classify_fault(exc)
+    def record_fault(self, exc: BaseException) -> None:
+        if self.worker_sentinel is not None:
+            self.worker_sentinel.record_fault(exc)
 
     def save_sharded_state(
         self,
