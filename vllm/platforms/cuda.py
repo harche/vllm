@@ -281,6 +281,8 @@ class CudaPlatformBase(Platform):
     ray_noset_device_env_vars: list[str] = [
         "RAY_EXPERIMENTAL_NOSET_CUDA_VISIBLE_DEVICES",
     ]
+    # Side streams used only by `probe_device_context`, by visible device ID.
+    _probe_streams: dict[int, torch.cuda.Stream] = {}
 
     @classmethod
     def get_hisparse_backend_cls(cls) -> str | None:
@@ -370,6 +372,14 @@ class CudaPlatformBase(Platform):
         )
 
     @classmethod
+    def prepare_device_fault_probe(cls, visible_device_id: int) -> None:
+        # Creating a stream waits for work already queued on the device, so
+        # the probe's stream is made at startup, while the device is idle.
+        cls._probe_streams[visible_device_id] = torch.cuda.Stream(
+            device=visible_device_id
+        )
+
+    @classmethod
     def probe_device_context(cls, visible_device_id: int) -> None:
         """Make one call into the CUDA runtime on the device. It raises the
         sticky error if one has left the context unusable.
@@ -380,14 +390,19 @@ class CudaPlatformBase(Platform):
         that lookup for a lost device. The probe would then fail before it
         reached CUDA, and the fault would go unclassified.
 
-        The call synchronizes a side stream, not the device. After a fault
-        the default stream may hold a kernel that never finishes, such as a
-        collective waiting on a dead peer, and a device-wide synchronize
-        would wait for it.
+        The call asks a side stream for its status and does not wait. After
+        a fault the default stream may hold a kernel that never finishes,
+        such as a collective waiting on a dead peer, and a synchronize of
+        the device would wait for it. The status query returns the sticky
+        error as soon as the device has reported it.
         """
-        # TODO: confirm on H100 that synchronizing an idle side stream
-        # returns the sticky error left by a device-side assert.
-        torch.cuda.Stream(device=visible_device_id).synchronize()
+        stream = cls._probe_streams.get(visible_device_id)
+        if stream is None:
+            # Not prepared at startup. Creating the stream is itself a CUDA
+            # call and raises the sticky error, but it can wait for queued
+            # work.
+            stream = torch.cuda.Stream(device=visible_device_id)
+        stream.query()
 
     @classmethod
     def is_fully_connected(cls, device_ids: list[int]) -> bool:

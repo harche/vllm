@@ -614,6 +614,13 @@ class Platform:
         raise NotImplementedError
 
     @classmethod
+    def prepare_device_fault_probe(cls, visible_device_id: int) -> None:
+        """Called once by a fault-tolerant worker when it has its device, so
+        a platform can set up what `classify_device_fault` needs while the
+        device is healthy and idle."""
+        return
+
+    @classmethod
     def classify_device_fault(
         cls, exc: BaseException | None, device_id: int, visible_device_id: int
     ) -> "DeviceFault | None":

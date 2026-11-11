@@ -499,7 +499,7 @@ class Worker(WorkerBase):
             self.device = torch.device(f"cuda:{visible_device_index}")
             torch.accelerator.set_device_index(self.device)
             if self.worker_sentinel is not None:
-                self.worker_sentinel.record_device_uuid()
+                self.worker_sentinel.on_device_ready()
 
             current_platform.check_if_supports_dtype(self.model_config.dtype)
 

@@ -308,6 +308,7 @@ def test_context_probe_uses_the_device_index_recorded_at_startup(monkeypatch):
         raise _cuda_error(719)
 
     monkeypatch.setattr(torch.cuda, "Stream", stream)
+    monkeypatch.setattr(CudaPlatformBase, "_probe_streams", {})
     exc = RuntimeError("NCCL error: unhandled cuda error")
 
     fault = LostDevicePlatform.classify_device_fault(
@@ -316,6 +317,36 @@ def test_context_probe_uses_the_device_index_recorded_at_startup(monkeypatch):
 
     assert probed == [3]
     assert fault == CudaFault(719, sticky=True, driver_error="GPU_IS_LOST")
+
+
+def test_context_probe_queries_the_stream_made_at_startup(monkeypatch):
+    """Creating a stream waits for work queued on the device, so the probe
+    must not create one when a fault is classified."""
+    from vllm.platforms.cuda import CudaPlatformBase
+
+    created = []
+
+    class Stream:
+        def __init__(self, device=None):
+            created.append(device)
+
+        def query(self) -> bool:
+            raise _cuda_error(710)
+
+    class Platform0(CudaPlatformBase):
+        @classmethod
+        def get_device_fault_state(cls, device_id: int = 0) -> CudaDeviceState:
+            return CudaDeviceState("NONE")
+
+    monkeypatch.setattr(torch.cuda, "Stream", Stream)
+    monkeypatch.setattr(CudaPlatformBase, "_probe_streams", {})
+
+    Platform0.prepare_device_fault_probe(3)
+    fault = Platform0.classify_device_fault(None, device_id=0, visible_device_id=3)
+    Platform0.classify_device_fault(None, device_id=0, visible_device_id=3)
+
+    assert created == [3]
+    assert fault == CudaFault(710, sticky=True, recovery_action="NONE")
 
 
 def test_platforms_do_not_classify_faults_by_default():

@@ -172,13 +172,22 @@ class WorkerSentinel:
             fault = self.classify_fault(None)
         return {"device_fault": fault}
 
-    def record_device_uuid(self) -> None:
-        """Read the device UUID once the worker has its device. A device that
-        is lost later cannot report it, so the fault log uses this copy."""
+    def on_device_ready(self) -> None:
+        """Called once the worker has its device. What fault classification
+        needs from a healthy device is set up here, because a device that
+        has faulted may not provide it."""
+        # A lost device cannot report its UUID, so the fault log uses this
+        # copy.
         try:
             self.device_uuid = current_platform.get_device_uuid(self.worker.local_rank)
         except Exception:
             logger.debug("Device UUID is not available", exc_info=True)
+        device = self.worker.device
+        if device is not None and device.index is not None:
+            try:
+                current_platform.prepare_device_fault_probe(device.index)
+            except Exception:
+                logger.warning("Device fault probe is not available", exc_info=True)
 
     def handle_command(self, ft_request: FaultToleranceRequest):
         """Dispatch an FT command by instruction name."""
