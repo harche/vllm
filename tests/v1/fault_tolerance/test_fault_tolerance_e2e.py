@@ -44,6 +44,9 @@ SCALE_DOWN_DEADLINE_S = 20
 # once armed (via /collective_rpc). Gated on VLLM_FT_TEST_INJECT_FAULT.
 # ``kind=raise`` raises a Python exception. ``kind=cuda_assert`` triggers a
 # device-side assert, a sticky CUDA error, on the worker's GPU.
+# ``local_rank=N`` arms only that tensor-parallel worker of the engine.
+# ``at=entry`` faults before the patched function runs, so the worker never
+# reaches the per-step TP barrier inside it.
 _FAULT_INJECT_SITECUSTOMIZE = """\
 import builtins
 import os
@@ -58,13 +61,16 @@ if _SPEC:
     _f = dict(kv.split("=", 1) for kv in _SPEC.split(","))
     _RANK = int(_f["rank"])
     _KIND = _f.get("kind", "raise")
+    _LOCAL_RANK = _f.get("local_rank")
+    _AT_ENTRY = _f.get("at") == "entry"
     _ARMED = [False]
 
     def _fault():
         if _KIND == "cuda_assert":
             import torch
 
-            # Each engine sees only its own GPU, so this is the worker's device.
+            # "cuda" is the current device of this process, which each
+            # worker sets to its own GPU.
             x = torch.zeros(4, device="cuda")
             x[torch.tensor([100], device="cuda")]
             torch.accelerator.synchronize()
@@ -78,15 +84,16 @@ if _SPEC:
         _orig = getattr(m, _ATTR)
         _sig = inspect.signature(_orig)
         def _wrapped(*args, **kwargs):
-            result = _orig(*args, **kwargs)
             bound = _sig.bind(*args, **kwargs)
             bound.apply_defaults()
-            dp_rank = bound.arguments.get("dp_rank")
-            if dp_rank == _RANK:
+            fire = bound.arguments.get("dp_rank") == _RANK and _ARMED[0]
+            if fire:
                 # One-shot: disarm before raising so post-retry steps pass.
-                if not _ARMED[0]:
-                    return result
                 _ARMED[0] = False
+                if _AT_ENTRY:
+                    _fault()
+            result = _orig(*args, **kwargs)
+            if fire:
                 _fault()
             return result
 
@@ -114,7 +121,11 @@ if _SPEC:
             and not getattr(w, "_ft_arm_patched", False)
         ):
             w._ft_arm_patched = True
-            w.Worker.arm_ft_fault_injection = lambda self, *a, **k: _arm()
+            w.Worker.arm_ft_fault_injection = lambda self, *a, **k: (
+                _arm()
+                if _LOCAL_RANK is None or self.local_rank == int(_LOCAL_RANK)
+                else None
+            )
         return module
 
     builtins.__import__ = _hook
@@ -122,9 +133,17 @@ if _SPEC:
 
 
 def _install_fault_injection(
-    monkeypatch, tmp_path, rank: int, kind: str = "raise"
+    monkeypatch,
+    tmp_path,
+    rank: int,
+    kind: str = "raise",
+    local_rank: int | None = None,
+    at_entry: bool = False,
 ) -> None:
     """Install a sitecustomize that faults on `rank` once armed.
+
+    `local_rank` limits the fault to one tensor-parallel worker of the rank.
+    `at_entry` faults before the DP sync instead of after it.
 
     Disarmed until the test calls /collective_rpc (needs VLLM_SERVER_DEV_MODE,
     set here).
@@ -137,7 +156,12 @@ def _install_fault_injection(
         "PYTHONPATH",
         str(site_dir) + (os.pathsep + existing if existing else ""),
     )
-    monkeypatch.setenv("VLLM_FT_TEST_INJECT_FAULT", f"rank={rank},kind={kind}")
+    spec = f"rank={rank},kind={kind}"
+    if local_rank is not None:
+        spec += f",local_rank={local_rank}"
+    if at_entry:
+        spec += ",at=entry"
+    monkeypatch.setenv("VLLM_FT_TEST_INJECT_FAULT", spec)
     monkeypatch.setenv("VLLM_SERVER_DEV_MODE", "1")
 
 
@@ -162,7 +186,9 @@ def _ft_server_args(extra_args: list[str] | None = None) -> list[str]:
     ]
 
 
-def _ft_manager(extra_args: list[str] | None = None, dp_size: int = 2):
+def _ft_manager(
+    extra_args: list[str] | None = None, dp_size: int = 2, tp_size: int = 1
+):
     """Build the shared DP+EP fault-tolerant server topology (one engine/server)."""
     from tests.v1.distributed.test_external_lb_dp import ExternalLBServerManager
 
@@ -171,7 +197,7 @@ def _ft_manager(extra_args: list[str] | None = None, dp_size: int = 2):
         dp_size,
         api_server_count=1,  # FT requires a single API server per engine
         base_server_args=_ft_server_args(extra_args),
-        tp_size=1,
+        tp_size=tp_size,
     )
 
 
@@ -580,7 +606,9 @@ def test_sticky_device_fault_reports_dead_and_scales_down(monkeypatch, tmp_path)
         _assert_serving_and_healthy(list(servers_by_rank.values()))
 
         # 2. Arm, then drive: the victim's worker hits the device-side assert.
-        _arm_ft_injection(list(servers_by_rank.values()))
+        # Only the victim is armed. It can fault before the next call returns,
+        # and a survivor that is waiting on the dead rank answers nothing.
+        _arm_ft_injection([victim])
         faulted = _drive_to_faulted(servers_by_rank, match_values={"dead", "unhealthy"})
 
         # 3. The victim reports DEAD with the worker's classification.
@@ -638,3 +666,56 @@ def test_sticky_device_fault_reports_dead_and_scales_down(monkeypatch, tmp_path)
         for server in survivors:
             completion = _complete(server.get_client())
             assert completion.choices[0].text
+
+
+@pytest.mark.skipif(not has_nixl_ep(), reason="Requires nixl_ep all2all backend")
+@multi_gpu_test(num_gpus=4)
+def test_sticky_device_fault_on_tensor_parallel_sibling_reports_dead(
+    monkeypatch, tmp_path
+):
+    """A sticky CUDA error on a TP worker that returns no output makes the rank DEAD.
+
+    With TP=2 only local rank 0 returns the step's output. The device-side
+    assert is injected into local rank 1 before the per-step TP barrier, so
+    local rank 0 fails at the barrier with an error that is not a device
+    fault. The engine has to ask both workers to report the classification.
+    """
+    dp_size = 2
+    victim_rank = 0
+    _install_fault_injection(
+        monkeypatch,
+        tmp_path,
+        victim_rank,
+        kind="cuda_assert",
+        local_rank=1,
+        at_entry=True,
+    )
+    with _ft_manager(dp_size=dp_size, tp_size=2) as servers:
+        assert len(servers) == dp_size
+        servers_by_rank = _servers_by_rank(servers, dp_size)
+        victim = servers_by_rank[victim_rank]
+
+        # 1. All engines healthy and serving.
+        _assert_serving_and_healthy(list(servers_by_rank.values()))
+
+        # 2. Arm the victim only, then drive until the barrier times out.
+        _arm_ft_injection([victim])
+        faulted = _drive_to_faulted(servers_by_rank, match_values={"dead", "unhealthy"})
+
+        # 3. The victim reports DEAD with the classification of the worker
+        # that returned no output.
+        status = faulted[victim_rank]
+        assert status["status"] == "dead", status
+        device_fault = dict(status["device_fault"])
+        # The recovery action is null on a driver that does not report one.
+        assert device_fault.pop("recovery_action") in ("NONE", None), status
+        assert device_fault == {
+            "backend": "cuda",
+            "error_code": 710,
+            "sticky": True,
+            "driver_error": None,
+            "restart_required": True,
+        }, status
+        survivor = faulted[1 - victim_rank]
+        assert survivor["status"] == "unhealthy", survivor
+        assert "device_fault" not in survivor, survivor
